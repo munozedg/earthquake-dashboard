@@ -2,7 +2,7 @@
 
 Interactive dashboard to explore global earthquake distribution using USGS data.
 
-**Live app:** [earthquake-dashboard.streamlit.app](https://earthquakes-dashboard.streamlit.app)
+**Live app:** [earthquakes-dashboard.streamlit.app](https://earthquakes-dashboard.streamlit.app)
 
 Built with Streamlit + Plotly · Data: [USGS Earthquake Hazards Program](https://earthquake.usgs.gov)
 
