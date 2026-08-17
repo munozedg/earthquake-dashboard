@@ -259,9 +259,18 @@ with tab4:
 
     with col_f:
         # Estacionalidad mensual
-        monthly = df.groupby("month").size().reset_index(name="count")
         month_names = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"]
+        # Garantizar los 12 meses aunque alguno tenga 0 sismos
+        monthly_counts = df.groupby("month").size()
+        monthly = (
+            pd.Series(0, index=range(1, 13))
+            .add(monthly_counts, fill_value=0)
+            .reset_index()
+        )
+        monthly.columns = ["month", "count"]
         monthly["mes"] = monthly["month"].apply(lambda x: month_names[x-1])
+        # Ordenar explícitamente por número de mes (no alfabético)
+        monthly = monthly.sort_values("month").reset_index(drop=True)
         fig_month = px.bar(
             monthly, x="mes", y="count",
             title="Estacionalidad mensual (todos los años)",
