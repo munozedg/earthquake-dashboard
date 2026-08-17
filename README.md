@@ -8,6 +8,8 @@ Built with Streamlit + Plotly · Data: [USGS Earthquake Hazards Program](https:/
 
 **Features:**
 - Filter by year range and minimum magnitude
+- Local SQLite cache for faster reloads and offline-friendly data access
+- Automatic refresh when new USGS events are detected
 - Annual counts by magnitude category
 - Global epicenter map
 - Magnitude & depth distributions

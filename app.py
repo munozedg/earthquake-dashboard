@@ -1,11 +1,14 @@
-import streamlit as st
+import pickle
+import sqlite3
+from datetime import datetime, timezone
+from io import StringIO
+from pathlib import Path
+
 import pandas as pd
-import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, date
 import requests
-from io import StringIO
+import streamlit as st
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -26,6 +29,195 @@ st.markdown("""
     .stMetric label { font-size: 0.85rem !important; }
 </style>
 """, unsafe_allow_html=True)
+
+CACHE_DB_PATH = Path(__file__).resolve().parent / "earthquake_cache.sqlite"
+CACHE_TTL_SECONDS = 15 * 60
+
+
+def init_cache_db() -> None:
+    conn = sqlite3.connect(CACHE_DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS earthquake_cache (
+            request_key TEXT PRIMARY KEY,
+            start_year INTEGER NOT NULL,
+            end_year INTEGER NOT NULL,
+            min_magnitude REAL NOT NULL,
+            data_payload BLOB NOT NULL,
+            last_event_time TEXT,
+            last_checked_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    df["year"] = df["time"].dt.year
+    df["month"] = df["time"].dt.month
+    df["month_name"] = df["time"].dt.strftime("%b")
+    df["mag"] = pd.to_numeric(df["mag"], errors="coerce")
+    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+    df["depth"] = pd.to_numeric(df["depth"], errors="coerce")
+    df["categoria"] = pd.cut(
+        df["mag"],
+        bins=[0, 4.9, 5.9, 6.9, 7.9, 10],
+        labels=["< 5", "5–5.9", "6–6.9", "7–7.9", "≥ 8"],
+        right=True,
+    )
+    return df
+
+
+def normalize_timestamp(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def save_cache_entry(conn, request_key: str, start_year: int, end_year: int, min_magnitude: float, df: pd.DataFrame, now: datetime) -> None:
+    payload = pickle.dumps(df)
+    latest_event = df["time"].dropna().max() if "time" in df.columns and not df.empty else None
+    last_event_time = normalize_timestamp(latest_event)
+    updated_at = normalize_timestamp(now)
+    last_checked_at = updated_at
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO earthquake_cache (
+            request_key, start_year, end_year, min_magnitude, data_payload,
+            last_event_time, last_checked_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            request_key,
+            start_year,
+            end_year,
+            min_magnitude,
+            sqlite3.Binary(payload),
+            last_event_time,
+            last_checked_at,
+            updated_at,
+        ),
+    )
+    conn.commit()
+
+
+def touch_cache_entry(conn, request_key: str, now: datetime) -> None:
+    updated_at = normalize_timestamp(now)
+    conn.execute(
+        "UPDATE earthquake_cache SET last_checked_at = ? , updated_at = ? WHERE request_key = ?",
+        (updated_at, updated_at, request_key),
+    )
+    conn.commit()
+
+
+def fetch_usgs_csv(url: str) -> pd.DataFrame:
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    return pd.read_csv(StringIO(response.text))
+
+
+def fetch_full_dataset(start_year: int, end_year: int, min_magnitude: float) -> pd.DataFrame:
+    frames = []
+    progress = st.progress(0, text="Descargando datos USGS…")
+    n_years = end_year - start_year + 1
+
+    for i, year in enumerate(range(start_year, end_year + 1)):
+        url = (
+            f"https://earthquake.usgs.gov/fdsnws/event/1/query.csv"
+            f"?format=csv&starttime={year}-01-01&endtime={year}-12-31"
+            f"&minmagnitude={min_magnitude}&orderby=time-asc&limit=200000"
+        )
+        try:
+            df_year = fetch_usgs_csv(url)
+            if not df_year.empty:
+                df_year["year"] = year
+                frames.append(df_year)
+        except Exception as e:
+            st.warning(f"No se pudo cargar {year}: {e}")
+
+        progress.progress((i + 1) / n_years, text=f"Cargando {year}…")
+
+    progress.empty()
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, ignore_index=True)
+    return prepare_dataframe(df)
+
+
+def fetch_incremental_dataset(start_year: int, end_year: int, min_magnitude: float, since: str) -> pd.DataFrame:
+    start_time = since
+    end_time = datetime(end_year, 12, 31, 23, 59, 59, tzinfo=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    url = (
+        "https://earthquake.usgs.gov/fdsnws/event/1/query.csv"
+        f"?format=csv&starttime={start_time}&endtime={end_time}"
+        f"&minmagnitude={min_magnitude}&orderby=time-asc&limit=200000"
+    )
+    try:
+        df = fetch_usgs_csv(url)
+    except Exception as e:
+        st.warning(f"No se pudieron sincronizar los nuevos datos: {e}")
+        return pd.DataFrame()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    return prepare_dataframe(df)
+
+
+def fetch_usgs(start_year: int, end_year: int, min_magnitude: float) -> pd.DataFrame:
+    init_cache_db()
+    request_key = f"{start_year}:{end_year}:{min_magnitude:.1f}"
+    now = datetime.now(timezone.utc)
+
+    conn = sqlite3.connect(CACHE_DB_PATH)
+    row = conn.execute(
+        "SELECT data_payload, last_event_time, last_checked_at, updated_at FROM earthquake_cache WHERE request_key = ?",
+        (request_key,),
+    ).fetchone()
+
+    if row is not None:
+        cached_df = pickle.loads(row[0])
+        last_checked_at = datetime.fromisoformat(row[2].replace("Z", "+00:00"))
+        if (now - last_checked_at).total_seconds() < CACHE_TTL_SECONDS:
+            conn.close()
+            return cached_df
+
+        new_events = pd.DataFrame()
+        if row[1]:
+            new_events = fetch_incremental_dataset(start_year, end_year, min_magnitude, row[1])
+
+        if not new_events.empty:
+            merged_df = pd.concat([cached_df, new_events], ignore_index=True)
+            merged_df = merged_df.drop_duplicates(subset=["id"], keep="last")
+            merged_df = prepare_dataframe(merged_df)
+            save_cache_entry(conn, request_key, start_year, end_year, min_magnitude, merged_df, now)
+            conn.close()
+            return merged_df
+
+        touch_cache_entry(conn, request_key, now)
+        conn.close()
+        return cached_df
+
+    df = fetch_full_dataset(start_year, end_year, min_magnitude)
+    if not df.empty:
+        save_cache_entry(conn, request_key, start_year, end_year, min_magnitude, df, now)
+    conn.close()
+    return df
+
 
 # ── Header ──────────────────────────────────────────────────────────────────────
 st.markdown('<div class="main-title">🌍 Distribución Global de Sismos</div>', unsafe_allow_html=True)
@@ -68,53 +260,6 @@ with st.sidebar:
     st.caption("Datos: earthquake.usgs.gov/fdsnws/event/1/")
 
 # ── Data fetch ──────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_usgs(start_year: int, end_year: int, min_magnitude: float) -> pd.DataFrame:
-    frames = []
-    progress = st.progress(0, text="Descargando datos USGS…")
-    n_years = end_year - start_year + 1
-
-    for i, year in enumerate(range(start_year, end_year + 1)):
-        url = (
-            f"https://earthquake.usgs.gov/fdsnws/event/1/query.csv"
-            f"?format=csv&starttime={year}-01-01&endtime={year}-12-31"
-            f"&minmagnitude={min_magnitude}&orderby=time-asc&limit=20000"
-        )
-        try:
-            r = requests.get(url, timeout=30)
-            r.raise_for_status()
-            df_year = pd.read_csv(StringIO(r.text))
-            df_year["year"] = year
-            frames.append(df_year)
-        except Exception as e:
-            st.warning(f"No se pudo cargar {year}: {e}")
-
-        progress.progress((i + 1) / n_years, text=f"Cargando {year}…")
-
-    progress.empty()
-
-    if not frames:
-        return pd.DataFrame()
-
-    df = pd.concat(frames, ignore_index=True)
-    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-    df["year"] = df["time"].dt.year
-    df["month"] = df["time"].dt.month
-    df["month_name"] = df["time"].dt.strftime("%b")
-    df["mag"] = pd.to_numeric(df["mag"], errors="coerce")
-    df["latitude"]  = pd.to_numeric(df["latitude"],  errors="coerce")
-    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
-    df["depth"]     = pd.to_numeric(df["depth"],     errors="coerce")
-
-    # Categoría de magnitud
-    df["categoria"] = pd.cut(
-        df["mag"],
-        bins=[0, 4.9, 5.9, 6.9, 7.9, 10],
-        labels=["< 5", "5–5.9", "6–6.9", "7–7.9", "≥ 8"],
-        right=True
-    )
-    return df
-
 # ── Load ─────────────────────────────────────────────────────────────────────────
 with st.spinner("Consultando USGS…"):
     df = fetch_usgs(year_range[0], year_range[1], min_mag)
@@ -122,6 +267,8 @@ with st.spinner("Consultando USGS…"):
 if df.empty:
     st.error("No se obtuvieron datos. Intenta ampliar el rango o bajar la magnitud mínima.")
     st.stop()
+
+st.caption("Cache local en earthquake_cache.sqlite · se actualiza automáticamente cuando USGS reporta nuevos sismos y se refresca cada 15 minutos.")
 
 # ── KPIs ─────────────────────────────────────────────────────────────────────────
 total = len(df)
