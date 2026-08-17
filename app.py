@@ -137,7 +137,7 @@ def fetch_full_dataset(start_year: int, end_year: int, min_magnitude: float) -> 
         url = (
             f"https://earthquake.usgs.gov/fdsnws/event/1/query.csv"
             f"?format=csv&starttime={year}-01-01&endtime={year}-12-31"
-            f"&minmagnitude={min_magnitude}&orderby=time-asc&limit=200000"
+            f"&minmagnitude={min_magnitude}&orderby=time-asc&limit=20000"
         )
         try:
             df_year = fetch_usgs_csv(url)
@@ -164,7 +164,7 @@ def fetch_incremental_dataset(start_year: int, end_year: int, min_magnitude: flo
     url = (
         "https://earthquake.usgs.gov/fdsnws/event/1/query.csv"
         f"?format=csv&starttime={start_time}&endtime={end_time}"
-        f"&minmagnitude={min_magnitude}&orderby=time-asc&limit=200000"
+        f"&minmagnitude={min_magnitude}&orderby=time-asc&limit=20000"
     )
     try:
         df = fetch_usgs_csv(url)
