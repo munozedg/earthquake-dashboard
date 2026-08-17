@@ -275,11 +275,10 @@ with tab4:
             monthly, x="mes", y="count",
             title="Estacionalidad mensual (todos los años)",
             labels={"mes": "Mes", "count": "Número de sismos"},
-            color="count",
-            color_continuous_scale="Reds",
             category_orders={"mes": month_names},
         )
-        fig_month.update_layout(plot_bgcolor="white", coloraxis_showscale=False)
+        fig_month.update_traces(marker_color="#e63946")
+        fig_month.update_layout(plot_bgcolor="white")
         st.plotly_chart(fig_month, use_container_width=True)
 
     # Top 10 sismos más grandes
